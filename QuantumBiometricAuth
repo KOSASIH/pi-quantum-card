@@ -1,0 +1,157 @@
+// Import libraries
+const express = require("express");
+const mongoose = require("mongoose");
+const multer = require("multer");
+const bodyParser = require("body-parser");
+const tf = require("@tensorflow/tfjs-node");
+const bcrypt = require("bcrypt");
+const cors = require("cors");
+
+// Initialize the app
+const app = express();
+app.use(bodyParser.json());
+app.use(cors());
+const upload = multer();
+
+// Connect to MongoDB
+mongoose.connect("mongodb://localhost/pi-quantum-card", {
+  useNewUrlParser: true,
+  useUnifiedTopology: true,
+});
+
+// User model
+const userSchema = new mongoose.Schema({
+  username: { type: String, required: true, unique: true },
+  password: { type: String, required: true },
+  biometricData: {
+    fingerprint: { type: Buffer },
+    faceScan: { type: Buffer },
+    voicePattern: { type: Buffer },
+  },
+  behaviorPatterns: { type: Array },
+});
+const User = mongoose.model("User", userSchema);
+
+// Behavior model
+const behaviorSchema = new mongoose.Schema({
+  userId: { type: mongoose.Schema.Types.ObjectId, ref: "User", required: true },
+  sessionData: { type: Array, required: true },
+});
+const Behavior = mongoose.model("Behavior", behaviorSchema);
+
+// TensorFlow Model for Behavior Analysis
+let behaviorModel;
+(async () => {
+  behaviorModel = tf.sequential();
+  behaviorModel.add(tf.layers.dense({ inputShape: [10], units: 16, activation: "relu" }));
+  behaviorModel.add(tf.layers.dense({ units: 8, activation: "relu" }));
+  behaviorModel.add(tf.layers.dense({ units: 1, activation: "sigmoid" }));
+  behaviorModel.compile({
+    optimizer: "adam",
+    loss: "binaryCrossentropy",
+    metrics: ["accuracy"],
+  });
+  console.log("TensorFlow model initialized");
+})();
+
+// Register user with biometrics
+app.post(
+  "/api/register",
+  upload.fields([
+    { name: "fingerprint" },
+    { name: "faceScan" },
+    { name: "voicePattern" },
+  ]),
+  async (req, res) => {
+    try {
+      const { username, password } = req.body;
+      const hashedPassword = await bcrypt.hash(password, 10);
+
+      const user = new User({
+        username,
+        password: hashedPassword,
+        biometricData: {
+          fingerprint: req.files.fingerprint[0].buffer,
+          faceScan: req.files.faceScan[0].buffer,
+          voicePattern: req.files.voicePattern[0].buffer,
+        },
+        behaviorPatterns: [],
+      });
+
+      await user.save();
+      res.status(201).json({ message: "User registered successfully." });
+    } catch (err) {
+      res.status(500).json({ error: err.message });
+    }
+  }
+);
+
+// Authenticate using biometrics
+app.post("/api/authenticate", async (req, res) => {
+  try {
+    const { username, biometricType, data } = req.body;
+    const user = await User.findOne({ username });
+
+    if (!user) {
+      return res.status(404).json({ message: "User not found." });
+    }
+
+    const isMatch = Buffer.compare(
+      user.biometricData[biometricType],
+      Buffer.from(data, "base64")
+    ) === 0;
+
+    if (!isMatch) {
+      return res.status(401).json({ message: "Authentication failed." });
+    }
+
+    res.status(200).json({ message: "Authentication successful." });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Record user behavior
+app.post("/api/behavior", async (req, res) => {
+  try {
+    const { userId, sessionData } = req.body;
+
+    const behavior = new Behavior({ userId, sessionData });
+    await behavior.save();
+
+    // Train TensorFlow model with new data
+    const behaviors = await Behavior.find({ userId });
+    const inputs = behaviors.map((b) => b.sessionData);
+    const labels = behaviors.map(() => 1); // Example: All trusted for now
+    const xs = tf.tensor2d(inputs);
+    const ys = tf.tensor2d(labels, [labels.length, 1]);
+
+    await behaviorModel.fit(xs, ys, {
+      epochs: 10,
+      batchSize: 4,
+    });
+
+    res.status(201).json({ message: "Behavior data recorded and model updated." });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Predict user behavior trust level
+app.post("/api/behavior/predict", async (req, res) => {
+  try {
+    const { sessionData } = req.body;
+
+    const prediction = behaviorModel.predict(tf.tensor2d([sessionData]));
+    const trustLevel = prediction.dataSync()[0];
+
+    res.status(200).json({ trustLevel });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Start the server
+app.listen(5000, () => {
+  console.log("Server running on port 5000");
+});
